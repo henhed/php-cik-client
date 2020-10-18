@@ -16,6 +16,8 @@ use Henhed\CiK\Exception\MessageException;
 
 class Client
 {
+    const MAJOR_VERSION  = 0;
+    const MINOR_VERSION  = 1;
 
     /**#@+
      * Protocol control byte values
@@ -87,8 +89,17 @@ class Client
     /** @var string */
     private $address = null;
 
-    /** @var resource */
+    /** @var resource|false */
     private $fd = false;
+
+    /** @var int */
+    private $serverVersion = 0;
+
+    /** @var int */
+    private $database = 0;
+
+    /** @var int */
+    private $correlationId = 0;
 
     /**
      * Constructor
@@ -240,17 +251,7 @@ class Client
         int   $mode = self::LIST_MODE_ALL_KEYS,
         array $tags = []
     ): array {
-        $tags = $this->formatTags($tags);
-        $head = \pack(
-            'c3cCC@16',
-            self::CONTROL_BYTE_1,
-            self::CONTROL_BYTE_2,
-            self::CONTROL_BYTE_3,
-            self::CMD_BYTE_LST,
-            $mode,
-            \count($tags)
-        );
-        $message = $head . $this->makeTagsMessage($tags);
+        $message = $this->makeLstMessage($mode, $tags);
         $this->writeMessage($message);
         $response = $this->readResponse();
 
@@ -278,22 +279,11 @@ class Client
      */
     public function nfo(?string $key = null): array
     {
-        $srv  = ($key === null);
-        $key  = $this->formatKey((string) $key);
-        $klen = \strlen($key);
-        $head = \pack(
-            'c3cC@16',
-            self::CONTROL_BYTE_1,
-            self::CONTROL_BYTE_2,
-            self::CONTROL_BYTE_3,
-            self::CMD_BYTE_NFO,
-            $klen
-        );
-        $message = $head . $key;
+        $message = $this->makeNfoMessage($key);
         $this->writeMessage($message);
         $response = $this->readResponse();
 
-        if ($srv) {
+        if (empty($key)) {
             $nfo = @\unpack('Jmemory_used/Jmemory_free', $response);
             if (!\is_array($nfo)) {
                 throw new ProtocolException(\sprintf(
@@ -301,6 +291,10 @@ class Client
                     \strtoupper(\bin2hex($response))
                 ));
             }
+            $nfo['version'] = [
+                'major' => (($this->serverVersion >> 4) & 0x0F),
+                'minor' => ($this->serverVersion & 0x0F)
+            ];
             return $nfo;
         } else {
             $nfo = @\unpack('Jexpires/Jmtime', $response);
@@ -328,6 +322,60 @@ class Client
     }
 
     /**
+     * @param int|null $db
+     * @return int
+     */
+    public function db(?int $db = null): int
+    {
+        if ($db !== null) {
+            $this->database = $db;
+        }
+        return $this->database;
+    }
+
+    /**
+     * @param bool $increment
+     * @return int
+     */
+    private function cid(bool $increment = false): int
+    {
+        if ($increment) {
+            $this->correlationId = ($this->correlationId + 1) & 0xFF;
+        }
+        return $this->correlationId;
+    }
+
+    /**
+     * @param  int    $op
+     * @param  string $opHeader
+     * @param  int    $flags
+     * @return string
+     */
+    private function makeMessageHeader(
+        int    $op,
+        string $opHeader,
+        int    $flags = 0
+    ): string {
+        $ver    = ((self::MAJOR_VERSION << 4) & 0xF0) | (self::MINOR_VERSION & 0x0F);
+        $cid    = $this->cid(true);
+        $db     = $this->db();
+        $relcnt = 0; // Always 0 for normal clients
+        return \pack(
+            'c3cCCCCC@12a12',
+            self::CONTROL_BYTE_1,
+            self::CONTROL_BYTE_2,
+            self::CONTROL_BYTE_3,
+            $op,
+            $ver,
+            $cid,
+            $db,
+            $relcnt,
+            $flags,
+            $opHeader
+        );
+    }
+
+    /**
      * @param  string[] $tags
      * @return string
      */
@@ -351,13 +399,9 @@ class Client
     ): string {
         $key  = $this->formatKey($key);
         $klen = \strlen($key);
-        $head = \pack(
-            'c3cCC@16',
-            self::CONTROL_BYTE_1,
-            self::CONTROL_BYTE_2,
-            self::CONTROL_BYTE_3,
+        $head = $this->makeMessageHeader(
             self::CMD_BYTE_GET,
-            $klen,
+            \pack('C', $klen),
             $flags
         );
         return $head . $key;
@@ -383,17 +427,16 @@ class Client
         $klen = \strlen($key);
         $tlen = \count($tags);
         $vlen = \strlen($value);
-        $head = \pack(
-            'c3cCCC@8NN',
-            self::CONTROL_BYTE_1,
-            self::CONTROL_BYTE_2,
-            self::CONTROL_BYTE_3,
+        $head = $this->makeMessageHeader(
             self::CMD_BYTE_SET,
-            $klen,
-            $tlen,
-            $flags,
-            $vlen,
-            ($ttl >= 0) ? $ttl : 0xFFFFFFFF
+            \pack(
+                'CC@4NN',
+                $klen,
+                $tlen,
+                $vlen,
+                ($ttl >= 0) ? $ttl : 0xFFFFFFFF
+            ),
+            $flags
         );
         return $head . $key . $this->makeTagsMessage($tags) . $value;
     }
@@ -406,14 +449,9 @@ class Client
     {
         $key  = $this->formatKey($key);
         $klen = \strlen($key);
-        $head = \pack(
-            'c3cCC@16',
-            self::CONTROL_BYTE_1,
-            self::CONTROL_BYTE_2,
-            self::CONTROL_BYTE_3,
+        $head = $this->makeMessageHeader(
             self::CMD_BYTE_DEL,
-            $klen,
-            0 // flags only for server internals
+            \pack('C', $klen)
         );
         return $head . $key;
     }
@@ -426,17 +464,41 @@ class Client
     private function makeClrMessage(int $mode, array $tags = []): string
     {
         $tags = $this->formatTags($tags);
-        $head = \pack(
-            'c3cCCC@16',
-            self::CONTROL_BYTE_1,
-            self::CONTROL_BYTE_2,
-            self::CONTROL_BYTE_3,
+        $head = $this->makeMessageHeader(
             self::CMD_BYTE_CLR,
-            $mode,
-            \count($tags),
-            0 // flags only for server internals
+            \pack('CC', $mode, \count($tags))
         );
         return $head . $this->makeTagsMessage($tags);
+    }
+
+    /**
+     * @param  int      $mode
+     * @param  string[] $tags
+     * @return string
+     */
+    private function makeLstMessage(int $mode, array $tags = []): string
+    {
+        $tags = $this->formatTags($tags);
+        $head = $this->makeMessageHeader(
+            self::CMD_BYTE_LST,
+            \pack('CC', $mode, \count($tags))
+        );
+        return $head . $this->makeTagsMessage($tags);
+    }
+
+    /**
+     * @param  string|null $key
+     * @return string
+     */
+    private function makeNfoMessage(?string $key = null): string
+    {
+        $key  = $this->formatKey((string) $key);
+        $klen = \strlen($key);
+        $head = $this->makeMessageHeader(
+            self::CMD_BYTE_NFO,
+            \pack('C', $klen)
+        );
+        return $head . $key;
     }
 
     /**
@@ -482,8 +544,8 @@ class Client
      */
     private function readResponse(): string
     {
-        $header   = $this->readMessage(8);
-        $response = @\unpack('c3cik/c1status/NsizeOrError', $header);
+        $header   = $this->readMessage(12);
+        $response = @\unpack('c3cik/cstatus/Cver/Ccid/@8/NsizeOrError', $header);
         if (!\is_array($response)) {
             $this->disconnect();
             throw new ProtocolException(\sprintf(
@@ -501,6 +563,14 @@ class Client
             throw new ProtocolException(\sprintf(
                 'Failed to parse CiK response header: 0x%s',
                 \strtoupper(\bin2hex($header))
+            ));
+        }
+        $this->serverVersion = $response['ver'];
+        if ($response['cid'] !== $this->cid()) {
+            throw new ProtocolException(\sprintf(
+                'Correlation ID mismatch: expected %d, received %d',
+                $this->cid(),
+                $response['cid']
             ));
         }
         $success = ($response['status'] === self::SUCCESS_BYTE);
